@@ -1,3 +1,4 @@
+// V6 (2026-11-03) - 与线上部署版一致; 目标事件: https://www.gatewebsite.com/zh/trade-events/btc-updown-5m
 // Gate 5m 事件目标价：Cloudflare Pages Function（实时优先版）
 // 路由：/api/target（文件位于 functions/api/target.js）
 // 思路：直连 Gate 多域名抢最快结果；直连被拦时用 Jina 文本模式；
@@ -369,6 +370,56 @@ export async function onRequestGet() {
     } catch (e) {
       debug.jinaDetailError = String(e);
     }
+  }
+
+  // 4) 兜底：Gate 公共行情 API 的 5m K线开盘价 = 期次开始时刻价格 ≈ 目标价
+  // api.gateio.ws 是纯 API 域名，无 Akamai 反爬，CF 机房可直连
+  try {
+    const kr = await fetchText(
+      "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=5m&limit=3",
+      { "Accept": "application/json", "User-Agent": UA },
+      4000,
+      deadline
+    );
+    debug.kline = { ok: kr.ok, status: kr.status, text: snip(kr.text), error: kr.error };
+    if (kr.ok) {
+      const arr = parseJsonLoose(kr.text);
+      const k = Array.isArray(arr) ? arr.find((c) => Number(c.t) === curStart) : null;
+      if (k && Number(k.o) > 0) {
+        return out(200, {
+          price: Number(k.o),
+          start: curStart,
+          end: curEnd,
+          source: "gate-kline-open",
+          eventId: null
+        });
+      }
+      // 刚开局 20 秒内 K线还没生成时，最新成交价 ≈ 期初价
+      if (now - curStart < 20) {
+        const tr2 = await fetchText(
+          "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT",
+          { "Accept": "application/json", "User-Agent": UA },
+          3000,
+          deadline
+        );
+        debug.ticker = { ok: tr2.ok, status: tr2.status, text: snip(tr2.text), error: tr2.error };
+        if (tr2.ok) {
+          const tk = parseJsonLoose(tr2.text);
+          const last = tk && tk[0] && Number(tk[0].last);
+          if (last > 0) {
+            return out(200, {
+              price: last,
+              start: curStart,
+              end: curEnd,
+              source: "gate-ticker-fresh",
+              eventId: null
+            });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    debug.klineError = String(e);
   }
 
   return out(502, { error: "target unavailable", debug });
